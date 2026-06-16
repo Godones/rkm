@@ -260,9 +260,19 @@ impl ArchRelocationType {
         _rela_stack: &[i64; RELA_STACK_DEPTH],
     ) -> Result<()> {
         let inst = location.read::<u32>();
-        // Use s32 for a sign-extension deliberately.
+        // Use s32 for sign-extension deliberately, matching Linux's LoongArch
+        // module loader:
         // s32 offset_hi20 = (void *)((v + 0x800) & ~0xfff) -
         //   (void *)((Elf_Addr)location & ~0xfff);
+        //
+        // PCALA relocations materialize an address from the current PC page
+        // plus this signed 32-bit page delta and a 12-bit page offset. The OS
+        // module allocator must therefore place module text in the same
+        // PC-relative address window as the kernel symbols it references
+        // (roughly +/-2GiB after page rounding). If the module is mapped in a
+        // different high-half alias, this relocation can still encode a value,
+        // but it will point at the wrong alias and later indirect calls may
+        // jump to unmapped or semantically wrong addresses.
         let left = (address + 0x800) & !0xfff;
         let right = location.0 & !0xfff;
         // for rust, we must transfer to i32 first to do sign-extension correctly.
