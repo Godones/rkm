@@ -5,7 +5,7 @@ use int_enum::IntEnum;
 
 use crate::{
     BIT, BIT_U64, ModuleErr, Result,
-    arch::{Ptr, aarch64::insn::*, get_rela_sym_idx, get_rela_type},
+    arch::{aarch64::insn::*, *},
     loader::*,
 };
 
@@ -19,22 +19,16 @@ pub struct PltEntry {
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
-struct ModPltSec {
-    shndx: usize,
-    num_entries: usize,
-    max_entries: usize,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-#[repr(C)]
 pub struct ModuleArchSpecific {
-    plt: ModPltSec,
+    got: ModSection,
+    plt: ModSection,
 }
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, IntEnum, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
-/// See <https://github.com/gimli-rs/object/blob/af3ca8a2817c8119e9b6d801bd678a8f1880309d/crates/examples/src/readobj/elf.rs#L2310C1-L2437C3>
+/// See <https://elixir.bootlin.com/linux/v6.6/source/arch/arm64/include/asm/elf.h#L28>
+/// See <https://github.com/gimli-rs/object/blob/main/src/elf.rs#L5104>
 pub enum ArchRelocationType {
     // Miscellaneous
     R_ARM_NONE = 0,
@@ -78,6 +72,10 @@ pub enum ArchRelocationType {
     R_AARCH64_MOVW_PREL_G2 = 291,
     R_AARCH64_MOVW_PREL_G2_NC = 292,
     R_AARCH64_MOVW_PREL_G3 = 293,
+    // P-page-rel. GOT off. ADRP 32:12.
+    R_AARCH64_ADR_GOT_PAGE = 311,
+    // Dir. GOT off. LD/ST imm. 11:3.
+    R_AARCH64_LD64_GOT_LO12_NC = 312,
     R_AARCH64_RELATIVE = 1027,
 }
 
@@ -134,23 +132,15 @@ fn module_emit_plt_entry(
     sechdrs: &[SectionHeader],
     address: u64,
 ) -> Result<&'static mut PltEntry> {
-    if module.arch.plt.num_entries >= module.arch.plt.max_entries {
-        log::error!("{}: too many PLT entries", module.name());
-        return Err(ModuleErr::ENOEXEC);
-    }
+    common_module_emit_plain_plt_entry(&mut module.arch.plt, sechdrs, address, emit_plt_entry)
+}
 
-    let plt_sec = &mut module.arch.plt;
-    let idx = plt_sec.num_entries;
-    let plt_entries_addr = sechdrs[plt_sec.shndx].sh_addr;
-    let plt_entries = unsafe {
-        core::slice::from_raw_parts_mut(plt_entries_addr as *mut PltEntry, plt_sec.max_entries)
-    };
-    let plt_entry_addr = &plt_entries[idx] as *const PltEntry as u64;
-
-    plt_entries[idx] = emit_plt_entry(address, plt_entry_addr)?;
-    plt_sec.num_entries += 1;
-
-    Ok(&mut plt_entries[idx])
+fn module_emit_got_entry(
+    module: &mut ModuleOwner<impl KernelModuleHelper>,
+    sechdrs: &[SectionHeader],
+    address: u64,
+) -> Result<&'static mut GotEntry> {
+    common_module_emit_got_entry(&mut module.arch.got, sechdrs, address)
 }
 
 /// TODO: Implement the function
@@ -330,6 +320,37 @@ impl ArchRelocationType {
             log::error!("ADR out of range for veneer emission");
             Err(ModuleErr::ENOEXEC)
         }
+    }
+
+    fn apply_r_aarch64_adr_got_page(
+        &self,
+        module: &mut ModuleOwner<impl KernelModuleHelper>,
+        sechdrs: &[SectionHeader],
+        location: Ptr,
+        address: u64,
+    ) -> Result<bool> {
+        let got = module_emit_got_entry(module, sechdrs, address)?;
+        let got_addr = got as *const GotEntry as u64;
+        self.reloc_insn_adrp(location, got_addr)
+    }
+
+    fn apply_r_aarch64_ld64_got_lo12_nc(
+        &self,
+        module: &mut ModuleOwner<impl KernelModuleHelper>,
+        sechdrs: &[SectionHeader],
+        location: Ptr,
+        address: u64,
+    ) -> Result<bool> {
+        let got = module_emit_got_entry(module, sechdrs, address)?;
+        let got_addr = got as *const GotEntry as u64;
+        self.reloc_insn_imm(
+            Aarch64RelocOp::RELOC_OP_ABS,
+            location,
+            got_addr,
+            3,
+            9,
+            Aarch64InsnImmType::AARCH64_INSN_IMM_12,
+        )
     }
 
     fn apply_relocation(
@@ -608,6 +629,19 @@ impl ArchRelocationType {
                 }
                 ovf
             }
+            Arm64RelTy::R_AARCH64_ADR_GOT_PAGE => {
+                // GOT-generating relocation. The GOT entry is keyed by S + A,
+                // and ADRP receives Page(GOT(S + A)) - Page(P).
+                // See <https://github.com/ARM-software/abi-aa/blob/main/aaelf64/aaelf64.rst#relocations>
+                self.apply_r_aarch64_adr_got_page(module, sechdrs, location, address)?
+            }
+            Arm64RelTy::R_AARCH64_LD64_GOT_LO12_NC => {
+                // Companion relocation for ADR_GOT_PAGE. The LDR unsigned
+                // immediate is scaled by 8, so encode GOT(S + A)[11:3].
+                // See <https://github.com/ARM-software/abi-aa/blob/main/aaelf64/aaelf64.rst#relocations>
+                check_overflow = false;
+                self.apply_r_aarch64_ld64_got_lo12_nc(module, sechdrs, location, address)?
+            }
             _ => {
                 log::error!("Relocation type {:?} not implemented yet", self);
                 return Err(ModuleErr::ENOEXEC);
@@ -679,6 +713,7 @@ pub fn module_frob_arch_sections<H: KernelModuleHelper>(
     owner: &mut ModuleOwner<H>,
 ) -> Result<()> {
     let mut num_plts = 0usize;
+    let mut num_gots = 0usize;
 
     for (idx, rela_sec) in elf.shdr_relocs.iter() {
         let shdr = &elf.section_headers[*idx];
@@ -692,38 +727,24 @@ pub fn module_frob_arch_sections<H: KernelModuleHelper>(
         }
 
         num_plts += count_plts(rela_sec);
+        num_gots += count_gots(rela_sec);
     }
 
-    if num_plts == 0 {
+    if num_plts == 0 && num_gots == 0 {
         return Ok(());
     }
 
-    let mut plt_section_idx = None;
-    for (idx, shdr) in elf.section_headers.iter().enumerate() {
-        let sec_name = elf.shdr_strtab.get_at(shdr.sh_name).unwrap_or("<unknown>");
-        if sec_name == ".plt" {
-            plt_section_idx = Some(idx);
-            break;
-        }
-    }
-
-    let Some(plt_section_idx) = plt_section_idx else {
-        log::error!("{:?}: module .PLT section missing", owner.name());
-        return Err(ModuleErr::ENOEXEC);
-    };
+    common_prepare_got_section(
+        elf,
+        &mut owner.arch.got,
+        num_gots,
+        core::mem::align_of::<GotEntry>() as u64,
+        0,
+    )?;
 
     // Linux reserves module PLT entries before final layout.
     // https://codebrowser.dev/linux/linux/arch/arm64/kernel/module-plts.c.html#337
-    let plt_sec = &mut elf.section_headers[plt_section_idx];
-    plt_sec.sh_type = goblin::elf::section_header::SHT_PROGBITS;
-    plt_sec.sh_flags = (goblin::elf::section_header::SHF_ALLOC
-        | goblin::elf::section_header::SHF_EXECINSTR) as u64;
-    plt_sec.sh_addralign = 4;
-    plt_sec.sh_size = (num_plts * core::mem::size_of::<PltEntry>()) as u64;
-
-    owner.arch.plt.shndx = plt_section_idx;
-    owner.arch.plt.num_entries = 0;
-    owner.arch.plt.max_entries = num_plts;
+    common_prepare_plt_section::<PltEntry>(elf, &mut owner.arch.plt, num_plts, 4, 0)?;
 
     Ok(())
 }
@@ -735,6 +756,18 @@ fn count_plts(rela_sec: &RelocSection) -> usize {
             matches!(
                 Arm64RelTy::try_from(rela.r_type),
                 Ok(Arm64RelTy::R_AARCH64_CALL26 | Arm64RelTy::R_AARCH64_JUMP26)
+            )
+        })
+        .count()
+}
+
+fn count_gots(rela_sec: &RelocSection) -> usize {
+    rela_sec
+        .iter()
+        .filter(|rela| {
+            matches!(
+                Arm64RelTy::try_from(rela.r_type),
+                Ok(Arm64RelTy::R_AARCH64_ADR_GOT_PAGE | Arm64RelTy::R_AARCH64_LD64_GOT_LO12_NC)
             )
         })
         .count()

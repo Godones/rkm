@@ -718,7 +718,7 @@ fn module_emit_got_entry(
     sechdrs: &SectionHeaders,
     address: u64,
 ) -> Option<&'static mut GotEntry> {
-    common_module_emit_got_entry(module, sechdrs, address)
+    common_module_emit_got_entry(&mut module.arch.got, sechdrs, address).ok()
 }
 
 /// See <https://elixir.bootlin.com/linux/v6.6/source/arch/riscv/kernel/module-sections.c#L32>
@@ -727,7 +727,15 @@ fn module_emit_plt_entry(
     sechdrs: &SectionHeaders,
     address: u64,
 ) -> Option<&'static mut PltEntry> {
-    common_module_emit_plt_entry(module, sechdrs, address, emit_plt_entry_func)
+    let arch = &mut module.arch;
+    common_module_emit_indexed_plt_entry(
+        &mut arch.plt,
+        &mut arch.plt_idx,
+        sechdrs,
+        address,
+        emit_plt_entry_func,
+    )
+    .ok()
 }
 
 const OPC_AUIPC: u32 = 0x0017;

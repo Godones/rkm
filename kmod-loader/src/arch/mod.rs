@@ -91,41 +91,45 @@ macro_rules! BIT_U64 {
     };
 }
 
-#[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
 pub use common::*;
 
-#[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
 mod common {
-    use goblin::elf::{Elf, Reloc, RelocSection, SectionHeaders};
+    use core::mem::size_of;
 
-    use crate::{KernelModuleHelper, ModuleErr, ModuleOwner, Result, arch::PltEntry};
-    #[derive(Debug, Clone, Copy, Default)]
-    #[repr(C)]
-    pub struct ModuleArchSpecific {
-        got: ModSection,
-        plt: ModSection,
-        plt_idx: ModSection,
-    }
+    use goblin::elf::{Elf, Reloc, RelocSection, SectionHeader};
+
+    use crate::{ModuleErr, Result};
 
     #[derive(Debug, Clone, Copy, Default)]
     #[repr(C)]
     pub struct ModSection {
-        shndx: usize,
-        num_entries: usize,
-        max_entries: usize,
+        pub(crate) shndx: usize,
+        pub(crate) num_entries: usize,
+        pub(crate) max_entries: usize,
     }
 
     #[derive(Debug, Clone, Copy)]
     #[repr(C)]
     pub struct GotEntry {
-        symbol_addr: u64,
+        pub(crate) symbol_addr: u64,
     }
 
     #[derive(Debug, Clone, Copy)]
     #[repr(C)]
     pub struct PltIdxEntry {
-        symbol_addr: u64,
+        pub(crate) symbol_addr: u64,
     }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    #[repr(C)]
+    pub struct IndexedModuleArchSpecific {
+        pub(crate) got: ModSection,
+        pub(crate) plt: ModSection,
+        pub(crate) plt_idx: ModSection,
+    }
+
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+    pub type ModuleArchSpecific = IndexedModuleArchSpecific;
 
     pub fn duplicate_rela(rela_sec: &RelocSection, idx: usize) -> bool {
         let rela_now = rela_sec.get(idx).expect("Invalid relocation index");
@@ -144,57 +148,29 @@ mod common {
             && rela1.r_sym == rela2.r_sym
     }
 
+    fn find_section(elf: &Elf, section_name: &str) -> Option<usize> {
+        elf.section_headers
+            .iter()
+            .enumerate()
+            .find_map(|(idx, shdr)| {
+                let sec_name = elf.shdr_strtab.get_at(shdr.sh_name).unwrap_or("<unknown>");
+                (sec_name == section_name).then_some(idx)
+            })
+    }
+
     fn get_got_entry(
         address: u64,
-        sechdrs: &SectionHeaders,
+        sechdrs: &[SectionHeader],
         sec: &ModSection,
     ) -> Option<&'static mut GotEntry> {
         let got_entries_addr = sechdrs[sec.shndx].sh_addr;
         let got_entries = unsafe {
-            core::slice::from_raw_parts_mut(
-                got_entries_addr as *mut GotEntry,
-                sec.max_entries as usize,
-            )
+            core::slice::from_raw_parts_mut(got_entries_addr as *mut GotEntry, sec.max_entries)
         };
 
-        got_entries[0..sec.num_entries as usize]
+        got_entries[..sec.num_entries]
             .iter_mut()
             .find(|entry| entry.symbol_addr == address)
-    }
-
-    fn get_plt_idx(address: u64, sechdrs: &SectionHeaders, sec: &ModSection) -> Option<usize> {
-        let plt_idx_addr = sechdrs[sec.shndx].sh_addr;
-        let plt_idx_entries = unsafe {
-            core::slice::from_raw_parts_mut(
-                plt_idx_addr as *mut PltIdxEntry,
-                sec.max_entries as usize,
-            )
-        };
-        plt_idx_entries[0..sec.num_entries as usize]
-            .iter()
-            .position(|entry| entry.symbol_addr == address)
-    }
-
-    fn get_plt_entry(
-        address: u64,
-        sechdrs: &SectionHeaders,
-        plt_sec: &ModSection,
-        plt_idx_sec: &ModSection,
-    ) -> Option<&'static mut PltEntry> {
-        let plt_idx = get_plt_idx(address, sechdrs, plt_idx_sec);
-        if plt_idx.is_none() {
-            return None;
-        }
-        let plt_idx = plt_idx.unwrap();
-
-        let plt_entries_addr = sechdrs[plt_sec.shndx].sh_addr;
-        let plt_entries = unsafe {
-            core::slice::from_raw_parts_mut(
-                plt_entries_addr as *mut PltEntry,
-                plt_sec.max_entries as usize,
-            )
-        };
-        Some(&mut plt_entries[plt_idx])
     }
 
     fn emit_got_entry(address: u64) -> GotEntry {
@@ -203,151 +179,234 @@ mod common {
         }
     }
 
+    pub fn common_module_emit_got_entry(
+        got_sec: &mut ModSection,
+        sechdrs: &[SectionHeader],
+        address: u64,
+    ) -> Result<&'static mut GotEntry> {
+        if let Some(got) = get_got_entry(address, sechdrs, got_sec) {
+            return Ok(got);
+        }
+
+        if got_sec.num_entries >= got_sec.max_entries {
+            log::error!("too many GOT entries");
+            return Err(ModuleErr::ENOEXEC);
+        }
+
+        let idx = got_sec.num_entries;
+        let got_entries_addr = sechdrs[got_sec.shndx].sh_addr;
+        let got_entries = unsafe {
+            core::slice::from_raw_parts_mut(got_entries_addr as *mut GotEntry, got_sec.max_entries)
+        };
+        got_entries[idx] = emit_got_entry(address);
+        got_sec.num_entries += 1;
+
+        Ok(&mut got_entries[idx])
+    }
+
+    pub fn common_prepare_got_section(
+        elf: &mut Elf,
+        got_sec: &mut ModSection,
+        num_gots: usize,
+        align: u64,
+        extra_entries: usize,
+    ) -> Result<()> {
+        if num_gots + extra_entries == 0 {
+            return Ok(());
+        }
+
+        let Some(got_section_idx) = find_section(elf, ".got") else {
+            log::error!("module .GOT section missing");
+            return Err(ModuleErr::ENOEXEC);
+        };
+
+        let shdr = &mut elf.section_headers[got_section_idx];
+        shdr.sh_type = goblin::elf::section_header::SHT_NOBITS;
+        shdr.sh_flags = goblin::elf::section_header::SHF_ALLOC as u64;
+        shdr.sh_addralign = align;
+        shdr.sh_size = ((num_gots + extra_entries) * size_of::<GotEntry>()) as u64;
+
+        got_sec.shndx = got_section_idx;
+        got_sec.num_entries = 0;
+        got_sec.max_entries = num_gots;
+        Ok(())
+    }
+
+    pub type ArchEmitPlainPltEntryFunc<P> = fn(address: u64, plt_entry_addr: u64) -> Result<P>;
+
+    pub fn common_module_emit_plain_plt_entry<P>(
+        plt_sec: &mut ModSection,
+        sechdrs: &[SectionHeader],
+        address: u64,
+        arch_emit_plt_entry_func: ArchEmitPlainPltEntryFunc<P>,
+    ) -> Result<&'static mut P> {
+        if plt_sec.num_entries >= plt_sec.max_entries {
+            log::error!("too many PLT entries");
+            return Err(ModuleErr::ENOEXEC);
+        }
+
+        let idx = plt_sec.num_entries;
+        let plt_entries_addr = sechdrs[plt_sec.shndx].sh_addr;
+        let plt_entries = unsafe {
+            core::slice::from_raw_parts_mut(plt_entries_addr as *mut P, plt_sec.max_entries)
+        };
+        let plt_entry_addr = &plt_entries[idx] as *const P as u64;
+
+        plt_entries[idx] = arch_emit_plt_entry_func(address, plt_entry_addr)?;
+        plt_sec.num_entries += 1;
+
+        Ok(&mut plt_entries[idx])
+    }
+
+    pub fn common_prepare_plt_section<P>(
+        elf: &mut Elf,
+        plt_sec: &mut ModSection,
+        num_plts: usize,
+        align: u64,
+        extra_entries: usize,
+    ) -> Result<()> {
+        if num_plts + extra_entries == 0 {
+            return Ok(());
+        }
+
+        let Some(plt_section_idx) = find_section(elf, ".plt") else {
+            log::error!("module .PLT section missing");
+            return Err(ModuleErr::ENOEXEC);
+        };
+
+        let shdr = &mut elf.section_headers[plt_section_idx];
+        shdr.sh_type = goblin::elf::section_header::SHT_PROGBITS;
+        shdr.sh_flags = (goblin::elf::section_header::SHF_ALLOC
+            | goblin::elf::section_header::SHF_EXECINSTR) as u64;
+        shdr.sh_addralign = align;
+        shdr.sh_size = ((num_plts + extra_entries) * size_of::<P>()) as u64;
+
+        plt_sec.shndx = plt_section_idx;
+        plt_sec.num_entries = 0;
+        plt_sec.max_entries = num_plts;
+        Ok(())
+    }
+
+    fn get_plt_idx(address: u64, sechdrs: &[SectionHeader], sec: &ModSection) -> Option<usize> {
+        let plt_idx_addr = sechdrs[sec.shndx].sh_addr;
+        let plt_idx_entries = unsafe {
+            core::slice::from_raw_parts_mut(plt_idx_addr as *mut PltIdxEntry, sec.max_entries)
+        };
+        plt_idx_entries[..sec.num_entries]
+            .iter()
+            .position(|entry| entry.symbol_addr == address)
+    }
+
+    fn get_indexed_plt_entry<P>(
+        address: u64,
+        sechdrs: &[SectionHeader],
+        plt_sec: &ModSection,
+        plt_idx_sec: &ModSection,
+    ) -> Option<&'static mut P> {
+        let plt_idx = get_plt_idx(address, sechdrs, plt_idx_sec)?;
+        let plt_entries_addr = sechdrs[plt_sec.shndx].sh_addr;
+        let plt_entries = unsafe {
+            core::slice::from_raw_parts_mut(plt_entries_addr as *mut P, plt_sec.max_entries)
+        };
+        Some(&mut plt_entries[plt_idx])
+    }
+
     fn emit_plt_idx_entry(address: u64) -> PltIdxEntry {
         PltIdxEntry {
             symbol_addr: address,
         }
     }
 
-    pub fn common_module_emit_got_entry(
-        module: &mut ModuleOwner<impl KernelModuleHelper>,
-        sechdrs: &SectionHeaders,
-        address: u64,
-    ) -> Option<&'static mut GotEntry> {
-        let got_sec = &mut module.arch.got;
-        let idx = got_sec.num_entries;
-        let got = get_got_entry(address, sechdrs, got_sec);
-        if got.is_some() {
-            return got;
-        }
-        // There is no GOT entry for val yet, create a new one.
-        let got_entries_addr = sechdrs[got_sec.shndx].sh_addr;
-        let got_entries = unsafe {
-            core::slice::from_raw_parts_mut(
-                got_entries_addr as *mut GotEntry,
-                got_sec.max_entries as usize,
-            )
-        };
-        got_entries[idx as usize] = emit_got_entry(address);
-        got_sec.num_entries += 1;
-        if got_sec.num_entries > got_sec.max_entries {
-            panic!("{}: GOT entries exceed the maximum limit", module.name());
-        }
-        return Some(&mut got_entries[idx as usize]);
-    }
+    pub type ArchEmitIndexedPltEntryFunc<P> =
+        fn(address: u64, plt_entry_addr: u64, plt_idx_entry_addr: u64) -> P;
 
-    type ArchEmitPltEntryFunc =
-        fn(address: u64, plt_entry_addr: u64, plt_idx_entry_addr: u64) -> PltEntry;
-
-    pub fn common_module_emit_plt_entry(
-        module: &mut ModuleOwner<impl KernelModuleHelper>,
-        sechdrs: &SectionHeaders,
+    pub fn common_module_emit_indexed_plt_entry<P>(
+        plt_sec: &mut ModSection,
+        plt_idx_sec: &mut ModSection,
+        sechdrs: &[SectionHeader],
         address: u64,
-        arch_emit_plt_entry_func: ArchEmitPltEntryFunc,
-    ) -> Option<&'static mut PltEntry> {
-        let plt_sec = &mut module.arch.plt;
-        let plt_idx_sec = &mut module.arch.plt_idx;
-        let plt = get_plt_entry(address, sechdrs, plt_sec, plt_idx_sec);
-        if plt.is_some() {
-            return plt;
+        arch_emit_plt_entry_func: ArchEmitIndexedPltEntryFunc<P>,
+    ) -> Result<&'static mut P> {
+        if let Some(plt) = get_indexed_plt_entry(address, sechdrs, plt_sec, plt_idx_sec) {
+            return Ok(plt);
         }
+
+        if plt_sec.num_entries >= plt_sec.max_entries {
+            log::error!("too many PLT entries");
+            return Err(ModuleErr::ENOEXEC);
+        }
+
         let nr = plt_sec.num_entries;
-        // There is no duplicate entry, create a new one
         let plt_idx_addr = sechdrs[plt_idx_sec.shndx].sh_addr;
         let plt_idx_entries = unsafe {
             core::slice::from_raw_parts_mut(
                 plt_idx_addr as *mut PltIdxEntry,
-                plt_idx_sec.max_entries as usize,
+                plt_idx_sec.max_entries,
             )
         };
-        // write the PLT.IDX(loongarch64)/GOT.PLT(riscv64) entry
         plt_idx_entries[nr] = emit_plt_idx_entry(address);
 
         let plt_entries_addr = sechdrs[plt_sec.shndx].sh_addr;
         let plt_entries = unsafe {
-            core::slice::from_raw_parts_mut(
-                plt_entries_addr as *mut PltEntry,
-                plt_sec.max_entries as usize,
-            )
+            core::slice::from_raw_parts_mut(plt_entries_addr as *mut P, plt_sec.max_entries)
         };
-        let plt_entry_addr = &plt_entries[nr] as *const PltEntry as u64;
+        let plt_entry_addr = &plt_entries[nr] as *const P as u64;
         let plt_idx_entry_addr = &plt_idx_entries[nr] as *const PltIdxEntry as u64;
 
-        // write the PLT entry
         plt_entries[nr] = arch_emit_plt_entry_func(address, plt_entry_addr, plt_idx_entry_addr);
 
         plt_sec.num_entries += 1;
         plt_idx_sec.num_entries += 1;
 
-        if plt_sec.num_entries > plt_sec.max_entries {
-            panic!("{}: too many PLT entries", module.name());
+        Ok(&mut plt_entries[nr])
+    }
+
+    pub fn common_prepare_plt_idx_section(
+        elf: &mut Elf,
+        plt_idx_sec: &mut ModSection,
+        num_plts: usize,
+        section_name: &str,
+        align: u64,
+        extra_entries: usize,
+    ) -> Result<()> {
+        if num_plts + extra_entries == 0 {
+            return Ok(());
         }
 
-        return Some(&mut plt_entries[nr]);
+        let Some(plt_idx_section_idx) = find_section(elf, section_name) else {
+            log::error!("module {} section missing", section_name);
+            return Err(ModuleErr::ENOEXEC);
+        };
+
+        let shdr = &mut elf.section_headers[plt_idx_section_idx];
+        shdr.sh_type = goblin::elf::section_header::SHT_PROGBITS;
+        shdr.sh_flags = goblin::elf::section_header::SHF_ALLOC as u64;
+        shdr.sh_addralign = align;
+        shdr.sh_size = ((num_plts + extra_entries) * size_of::<PltIdxEntry>()) as u64;
+
+        plt_idx_sec.shndx = plt_idx_section_idx;
+        plt_idx_sec.num_entries = 0;
+        plt_idx_sec.max_entries = num_plts;
+        Ok(())
     }
 
     pub type ArchGotPltCounterFunc = fn(rela_sec: &RelocSection) -> (usize, usize);
 
-    fn check_got_plt<H: KernelModuleHelper>(
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+    pub fn common_module_frob_arch_sections<H: crate::KernelModuleHelper>(
         elf: &mut Elf,
-        owner: &mut ModuleOwner<H>,
-        plt_idx_name: &str,
-    ) -> Result<()> {
-        let mut got_section_idx = None;
-        let mut plt_section_idx = None;
-        let mut plt_idx_section_idx = None;
-        // Find the empty .plt sections.
-        for (idx, shdr) in elf.section_headers.iter_mut().enumerate() {
-            let sec_name = elf.shdr_strtab.get_at(shdr.sh_name).unwrap_or("<unknown>");
-            if sec_name == ".got" {
-                got_section_idx = Some(idx);
-            } else if sec_name == ".plt" {
-                plt_section_idx = Some(idx);
-            } else if sec_name == plt_idx_name {
-                plt_idx_section_idx = Some(idx);
-            }
-        }
-        if got_section_idx.is_none() {
-            log::error!("{:?}: module .GOT section(s) missing", owner.name());
-            return Err(ModuleErr::ENOEXEC);
-        }
-        if plt_section_idx.is_none() {
-            log::error!("{:?}: module .PLT section(s) missing", owner.name());
-            return Err(ModuleErr::ENOEXEC);
-        }
-        if plt_idx_section_idx.is_none() {
-            log::error!(
-                "{:?}: module {} section(s) missing",
-                owner.name(),
-                plt_idx_name.to_uppercase()
-            );
-            return Err(ModuleErr::ENOEXEC);
-        }
-
-        owner.arch.got.shndx = got_section_idx.unwrap();
-        owner.arch.plt.shndx = plt_section_idx.unwrap();
-        owner.arch.plt_idx.shndx = plt_idx_section_idx.unwrap();
-
-        Ok(())
-    }
-
-    pub fn common_module_frob_arch_sections<H: KernelModuleHelper>(
-        elf: &mut Elf,
-        owner: &mut ModuleOwner<H>,
+        owner: &mut crate::ModuleOwner<H>,
         got_plt_counter_func: ArchGotPltCounterFunc,
         plt_idx_name: &str,
     ) -> Result<()> {
         let mut num_plts = 0;
         let mut num_gots = 0;
-        // Calculate the maxinum number of entries
         for (idx, rela_sec) in elf.shdr_relocs.iter() {
             let shdr = &elf.section_headers[*idx];
             if shdr.sh_type != goblin::elf::section_header::SHT_RELA {
                 continue;
             }
-            let infosec = shdr.sh_info;
-            let to_section = &elf.section_headers[infosec as usize];
-            // ignore relocations that operate on non-exec sections
+            let to_section = &elf.section_headers[shdr.sh_info as usize];
             if to_section.sh_flags & goblin::elf::section_header::SHF_EXECINSTR as u64 == 0 {
                 continue;
             }
@@ -362,42 +421,24 @@ mod common {
             num_plts,
             num_gots
         );
-        check_got_plt(elf, owner, plt_idx_name)?;
 
-        let got_section_idx = owner.arch.got.shndx;
-        let plt_section_idx = owner.arch.plt.shndx;
-        let plt_idx_section_idx = owner.arch.plt_idx.shndx;
+        common_prepare_got_section(elf, &mut owner.arch.got, num_gots, 64, 1)?;
+        common_prepare_plt_section::<crate::arch::PltEntry>(
+            elf,
+            &mut owner.arch.plt,
+            num_plts,
+            64,
+            1,
+        )?;
+        common_prepare_plt_idx_section(
+            elf,
+            &mut owner.arch.plt_idx,
+            num_plts,
+            plt_idx_name,
+            64,
+            1,
+        )?;
 
-        {
-            let got_sec = &mut elf.section_headers[got_section_idx];
-            got_sec.sh_type = goblin::elf::section_header::SHT_NOBITS;
-            got_sec.sh_flags = goblin::elf::section_header::SHF_ALLOC as u64;
-            got_sec.sh_addralign = 64; // TODO: L1_CACHE_BYTES
-            got_sec.sh_size = (num_gots as u64 + 1) * size_of::<GotEntry>() as u64;
-            owner.arch.got.num_entries = 0;
-            owner.arch.got.max_entries = num_gots;
-        }
-
-        {
-            let plt_sec = &mut elf.section_headers[plt_section_idx];
-            plt_sec.sh_type = goblin::elf::section_header::SHT_PROGBITS;
-            plt_sec.sh_flags = (goblin::elf::section_header::SHF_ALLOC
-                | goblin::elf::section_header::SHF_EXECINSTR) as u64;
-            plt_sec.sh_addralign = 64;
-            plt_sec.sh_size = (num_plts as u64 + 1) * size_of::<PltEntry>() as u64;
-            owner.arch.plt.num_entries = 0;
-            owner.arch.plt.max_entries = num_plts;
-        }
-
-        {
-            let plt_idx_sec = &mut elf.section_headers[plt_idx_section_idx];
-            plt_idx_sec.sh_type = goblin::elf::section_header::SHT_PROGBITS;
-            plt_idx_sec.sh_flags = goblin::elf::section_header::SHF_ALLOC as u64;
-            plt_idx_sec.sh_addralign = 64;
-            plt_idx_sec.sh_size = (num_plts as u64 + 1) * size_of::<PltIdxEntry>() as u64;
-            owner.arch.plt_idx.num_entries = 0;
-            owner.arch.plt_idx.max_entries = num_plts;
-        }
         Ok(())
     }
 }
